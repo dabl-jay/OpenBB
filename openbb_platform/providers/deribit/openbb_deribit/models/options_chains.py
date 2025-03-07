@@ -2,6 +2,8 @@
 
 # pylint: disable=unused-argument
 
+import contextlib
+import logging
 from datetime import datetime
 from typing import Any, Optional, Union
 
@@ -127,7 +129,8 @@ class DeribitOptionsChainsFetcher(
         from openbb_deribit.utils.helpers import get_options_symbols
         from pandas import to_datetime
         from websockets.asyncio.client import connect
-        from warnings import warn
+
+        logger = logging.getLogger(__name__)
 
         # We need to identify each option contract in order to fetch the chains data.
         symbols_dict: dict[str, str] = {}
@@ -141,7 +144,7 @@ class DeribitOptionsChainsFetcher(
         # We subscribe to each contract symbol and break the connection when we have all the data for an expiry.
         # If it takes too long, we break the connection and return an error message.
         results: list = []
-        messages: set = set()
+        messages: list = []
 
         async def call_api(expiration):
             """Call the Deribit API."""
@@ -153,14 +156,22 @@ class DeribitOptionsChainsFetcher(
                 "method": "public/subscribe",
                 "params": {"channels": ["ticker." + d + ".100ms" for d in symbols]},
             }
-            async with connect("wss://www.deribit.com/ws/api/v2") as websocket:
+            websocket = None
+            try:
+                websocket = await connect("wss://www.deribit.com/ws/api/v2")
                 await websocket.send(json.dumps(msg))
-                try:
-                    await asyncio.wait_for(
-                        receive_data(websocket, symbols, received_symbols), timeout=2.0
-                    )
-                except asyncio.TimeoutError:
-                    messages.add(f"Timeout reached for {expiration}, data incomplete.")
+                await asyncio.wait_for(
+                    receive_data(websocket, symbols, received_symbols), timeout=2.0
+                )
+            except asyncio.TimeoutError:
+                messages.append(f"Timeout reached for {expiration}, data incomplete.")
+            except Exception as e:
+                messages.append(f"Error for {expiration}: {str(e)}")
+            finally:
+                # Ensure websocket is properly closed to prevent hanging connections
+                if websocket:
+                    with contextlib.suppress(Exception):
+                        await websocket.close()
 
         async def receive_data(websocket, symbols, received_symbols):
             """Receive the data from the websocket with a timeout."""
@@ -169,13 +180,17 @@ class DeribitOptionsChainsFetcher(
                     response = await websocket.recv()
                 except websockets.ConnectionClosed:
                     break
+                except Exception:
+                    # Handle any other exceptions by breaking the loop
+                    break
+
                 data = json.loads(response)
 
                 if "params" not in data:
                     continue
 
                 if "error" in data and data.get("error"):
-                    messages.add(f"Error while receiving data -> {data['error']}")
+                    messages.append(f"Error while receiving data -> {data['error']}")
                     break
 
                 res = data.get("params", {}).get("data", {})
@@ -222,20 +237,35 @@ class DeribitOptionsChainsFetcher(
                     results.append(result)
 
                     if len(received_symbols) == len(symbols):
-                        await websocket.close()
-                        break
+                        return  # Return instead of closing websocket here
 
         tasks = [
             asyncio.create_task(call_api(expiration)) for expiration in symbols_dict
         ]
-        await asyncio.gather(*tasks, return_exceptions=True)
+        try:
+            await asyncio.gather(*tasks, return_exceptions=True)
+        except Exception as e:
+            # Log any unexpected exceptions
+            logger.error(f"Error during options chain fetching: {str(e)}")
+        finally:
+            # Cancel any remaining tasks to prevent memory leaks
+            for task in tasks:
+                if not task.done():
+                    task.cancel()
 
         if messages and not results:
             raise OpenBBError(", ".join(messages))
 
+        # Store messages in the result metadata instead of using the warning system
         if results and messages:
-            for message in messages:
-                warn(message)
+            # Deduplicate messages
+            unique_messages = list(set(messages))
+            # Log all unique messages but don't trigger warnings
+            for message in unique_messages:
+                logger.warning(message)
+
+            # We'll add the warnings to the OBBject metadata later in transform_data
+            kwargs["warning_messages"] = unique_messages
 
         if not results and not messages:
             raise EmptyDataError("All requests returned empty with no error messages.")
@@ -278,4 +308,12 @@ class DeribitOptionsChainsFetcher(
         df.loc[:, "contract_size"] = 1
         results = df.to_dict(orient="list")
 
-        return DeribitOptionsChainsData.model_validate(results)
+        result = DeribitOptionsChainsData.model_validate(results)
+
+        # Add any warning messages to the metadata
+        if warning_messages := kwargs.get("warning_messages", []):
+            if not hasattr(result, "metadata") or result.metadata is None:
+                result.metadata = {}
+            result.metadata["warnings"] = warning_messages
+
+        return result
