@@ -293,6 +293,7 @@ async def get_ohlc_data(
                 .convert_dtypes()
             )
             df.date = to_datetime(df.date, unit="ms", origin="unix", utc=True)
+            df.date = df.date.dt.tz_localize(None)
             if interval == "1D":
                 df.date = df.date.dt.date
             df.loc[:, "symbol"] = symbol
